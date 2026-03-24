@@ -8,3 +8,4 @@ faiss-cpu
 chromadb
 langchain-google-genai
 pyhton-dotenv
+typesense
