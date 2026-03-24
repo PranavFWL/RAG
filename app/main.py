@@ -5,6 +5,8 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import Optional, List
 from models import QueryRequest, QueryResponse, Source
+from fastapi.responses import StreamingResponse
+from models import QueryRequest, QueryResponse, Source, ChatRequest
 from rag_pipeline import RAGPipeline
 from chat import get_history, add_message, clear_history, build_prompt_with_history
 import time
@@ -45,6 +47,54 @@ async def health():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """
+    Streaming chat endpoint
+    Returns response word by word like ChatGPT
+    instead of waiting for full response
+    """
+    try:
+        session_id = req.session_id or str(uuid.uuid4())
+
+        # Retrieve relevant chunks
+        results = pipeline.retrieve(req.question, req.top_k, req.min_score)
+
+        if not results:
+            async def no_results():
+                yield f"data: I don't know based on the documents.\n\n"
+                yield f"data: [DONE]\n\n"
+            return StreamingResponse(no_results(), media_type="text/event-stream")
+
+        # Build context and prompt
+        context = "\n\n".join([r["content"] for r in results])
+        prompt = build_prompt_with_history(context, req.question, session_id)
+
+        # Stream response
+        async def generate():
+            full_response = ""
+            # Stream from Ollama
+            for chunk in pipeline.llm.stream(prompt):
+                token = chunk.content
+                full_response += token
+                yield f"data: {token}\n\n"
+
+            # Save to history after streaming
+            add_message(session_id, "user", req.question)
+            add_message(session_id, "assistant", full_response)
+
+            # Send sources at the end
+            sources = list(set([
+                r["metadata"].get("source", "unknown") 
+                for r in results
+            ]))
+            yield f"data: [SOURCES]{','.join(sources)}\n\n"
+            yield f"data: [DONE]\n\n"
+
+        return StreamingResponse(generate(), media_type="text/event-stream")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
@@ -65,12 +115,6 @@ async def query(req: QueryRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-class ChatRequest(BaseModel):
-    question: str
-    session_id: Optional[str] = None
-    top_k: Optional[int] = 5
-    min_score: Optional[float] = 0.2
 
 @app.post("/chat")
 async def chat(req: ChatRequest):

@@ -14,6 +14,14 @@
             align-items: center;
             height: 100vh;
         }
+        .cursor {
+        display: inline-block;
+        animation: blink 1s infinite;
+        }
+        @keyframes blink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0; }
+        }
         .chat-container {
             width: 800px;
             height: 90vh;
@@ -224,40 +232,87 @@
     }
 
     async function sendMessage() {
-        const input = document.getElementById('input');
-        const btn = document.getElementById('send-btn');
-        const question = input.value.trim();
-        if (!question) return;
+    const input = document.getElementById('input');
+    const btn = document.getElementById('send-btn');
+    const question = input.value.trim();
+    if (!question) return;
 
-        addMessage('user', question);
-        input.value = '';
-        btn.disabled = true;
-        showTyping();
+    addMessage('user', question);
+    input.value = '';
+    btn.disabled = true;
 
-        try {
-            const res = await fetch('/chat', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    question: question,
-                    session_id: sessionId,
-                    top_k: 5,
-                    min_score: 0.2
-                })
-            });
+    // Create bot message div for streaming
+    const welcome = document.getElementById('welcome');
+    if (welcome) welcome.remove();
 
-            const data = await res.json();
-            sessionId = data.session_id;
-            removeTyping();
-            addMessage('bot', data.answer, data.sources, data.confidence);
+    const messages = document.getElementById('messages');
+    const div = document.createElement('div');
+    div.className = 'message bot';
+    div.id = 'streaming-msg';
 
-        } catch(err) {
-            removeTyping();
-            addMessage('bot', 'Error connecting to server. Is Ollama running?');
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.innerHTML = '<span class="cursor">▌</span>';
+    div.appendChild(bubble);
+    messages.appendChild(div);
+    messages.scrollTop = messages.scrollHeight;
+
+    try {
+        const res = await fetch('/chat/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                question: question,
+                session_id: sessionId,
+                top_k: 5,
+                min_score: 0.0
+            })
+        });
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let fullText = '';
+        let sources = [];
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            const chunk = decoder.decode(value);
+            const lines = chunk.split('\n');
+
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const token = line.slice(6);
+
+                    if (token === '[DONE]') {
+                        // Remove cursor
+                        bubble.innerHTML = fullText;
+                        // Add sources
+                        if (sources.length > 0) {
+                            const srcDiv = document.createElement('div');
+                            srcDiv.className = 'sources';
+                            srcDiv.textContent = 'Sources: ' + sources.join(', ');
+                            div.appendChild(srcDiv);
+                        }
+                    } else if (token.startsWith('[SOURCES]')) {
+                        sources = token.replace('[SOURCES]', '').split(',');
+                    } else {
+                        fullText += token;
+                        bubble.innerHTML = fullText + '<span class="cursor">▌</span>';
+                        messages.scrollTop = messages.scrollHeight;
+                    }
+                }
+            }
         }
 
-        btn.disabled = false;
-        input.focus();
+    } catch(err) {
+        bubble.innerHTML = 'Error connecting to server. Is Ollama running?';
+    }
+
+    div.id = '';
+    btn.disabled = false;
+    input.focus();
     }
 </script>
 </body>

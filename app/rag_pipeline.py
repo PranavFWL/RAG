@@ -6,6 +6,8 @@ from langchain_ollama import ChatOllama
 from langchain_community.document_loaders import PyMuPDFLoader, DirectoryLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
+from rank_bm25 import BM25Okapi
+import re
 import chromadb
 from typing import List, Dict, Any
 import os
@@ -47,6 +49,10 @@ class RAGPipeline:
 
         # Step 4 - Load and index documents
         self._load_documents()
+        print("✅ RAG Pipeline ready!\n")
+
+        self._load_documents()
+        self._build_bm25()  # ← add this line
         print("✅ RAG Pipeline ready!\n")
 
     # ── Document Loading ───────────────────────────────────
@@ -101,32 +107,77 @@ class RAGPipeline:
         )
         print(f"💾 Stored {len(chunks)} chunks in ChromaDB")
 
+    def _build_bm25(self):
+        """Build BM25 index from stored chunks"""
+        results = self.collection.get(include=["documents"])
+        self.corpus = results["documents"]
+        tokenized = [re.findall(r'\w+', doc.lower()) for doc in self.corpus]
+        self.bm25 = BM25Okapi(tokenized)
+        print(f"✅ BM25 index built with {len(self.corpus)} documents")
+
     # ── Retrieval ──────────────────────────────────────────
     def retrieve(self, query: str, top_k: int = 5, min_score: float = 0.0) -> List[Dict]:
-        """Find most relevant chunks for a query"""
+        """
+        Hybrid retrieval = Dense (ChromaDB) + Sparse (BM25)
+        Combines semantic search with keyword search
+        """
 
+        # ── Dense retrieval (semantic) ─────────────────────
         query_embedding = self.embedder.encode([query]).tolist()
-
-        results = self.collection.query(
+        dense_results = self.collection.query(
             query_embeddings=query_embedding,
             n_results=top_k,
             include=["documents", "metadatas", "distances"]
         )
 
-        retrieved = []
-        for i in range(len(results["documents"][0])):
-            # ChromaDB returns L2 distances, convert properly
-            distance = results["distances"][0][i]
-            score = 1 / (1 + distance)  # converts distance to 0-1 similarity
+        dense_scores = {}
+        for i in range(len(dense_results["documents"][0])):
+            doc = dense_results["documents"][0][i]
+            distance = dense_results["distances"][0][i]
+            score = 1 / (1 + distance)
+            dense_scores[doc] = {
+                "score":    score,
+                "metadata": dense_results["metadatas"][0][i],
+                "content":  doc
+            }
 
-            if score >= min_score:
-                retrieved.append({
-                    "content":  results["documents"][0][i],
-                    "metadata": results["metadatas"][0][i],
-                    "score":    round(score, 3)
-                })
+        # ── Sparse retrieval (BM25 keyword) ───────────────
+        tokenized_query = re.findall(r'\w+', query.lower())
+        bm25_scores = self.bm25.get_scores(tokenized_query)
 
-        return retrieved
+        # Normalize BM25 scores to 0-1
+        max_bm25 = max(bm25_scores) if max(bm25_scores) > 0 else 1
+        bm25_normalized = bm25_scores / max_bm25
+
+        # ── Combine scores (RRF fusion) ────────────────────
+        combined = {}
+        for i, doc in enumerate(self.corpus):
+            dense_score = dense_scores.get(doc, {}).get("score", 0)
+            sparse_score = float(bm25_normalized[i])
+
+            # 60% dense + 40% sparse
+            final_score = (0.6 * dense_score) + (0.4 * sparse_score)
+
+            if final_score >= min_score:
+                metadata = self.collection.get(
+                    where={"source": doc[:50]}
+                ) if doc not in dense_scores else dense_scores.get(doc, {}).get("metadata", {})
+
+                combined[doc] = {
+                    "content":  doc,
+                    "score":    round(final_score, 3),
+                    "metadata": dense_scores.get(doc, {}).get("metadata", {})
+                }
+
+        # Sort by score and return top_k
+        sorted_results = sorted(
+            combined.values(),
+            key=lambda x: x["score"],
+            reverse=True
+        )[:top_k]
+
+        return sorted_results
+
 
     # ── Answer Generation ──────────────────────────────────
     def answer(self, question: str, top_k: int = 5, min_score: float = 0.2) -> Dict[str, Any]:
@@ -146,15 +197,23 @@ class RAGPipeline:
         context = "\n\n".join([r["content"] for r in results])
 
         # Build prompt
-        prompt = f"""You are a helpful assistant. Answer the question using ONLY the context below.
-If the answer is not in the context, say "I don't know based on the documents."
+        prompt = f"""You are a precise and helpful assistant for document analysis.
 
-Context:
-{context}
+        INSTRUCTIONS:
+        - Answer ONLY using the provided context
+        - Be concise and direct
+        - If asked for details, use bullet points
+        - Always mention which document the answer comes from
+        - If answer is not in context, say exactly: "This information is not available in the provided documents."
+        - Never make up information
 
-Question: {question}
+        CONTEXT FROM DOCUMENTS:
+        {context}
 
-Answer:"""
+        QUESTION: {question}
+
+        ANSWER (be concise, cite document name):"""
+
 
         # Generate answer with Ollama
         response = self.llm.invoke(prompt)

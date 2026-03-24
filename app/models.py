@@ -19,3 +19,9 @@ class QueryResponse(BaseModel):
     answer: str
     sources: List[Source]
     confidence: float
+
+class ChatRequest(BaseModel):
+    question: str
+    session_id: Optional[str] = None
+    top_k: Optional[int] = 5
+    min_score: Optional[float] = 0.2
