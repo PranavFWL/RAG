@@ -8,6 +8,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 import chromadb
 from typing import List, Dict, Any
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 load_dotenv()
 
@@ -34,7 +37,7 @@ class RAGPipeline:
         print("✅ Ollama phi3 connected")
 
         # Step 2 - Embedding model (local, no API needed)
-        self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        self.embedder = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
         print("✅ Embedding model loaded")
 
         # Step 3 - ChromaDB vector store
@@ -99,7 +102,7 @@ class RAGPipeline:
         print(f"💾 Stored {len(chunks)} chunks in ChromaDB")
 
     # ── Retrieval ──────────────────────────────────────────
-    def retrieve(self, query: str, top_k: int = 5, min_score: float = 0.2) -> List[Dict]:
+    def retrieve(self, query: str, top_k: int = 5, min_score: float = 0.0) -> List[Dict]:
         """Find most relevant chunks for a query"""
 
         query_embedding = self.embedder.encode([query]).tolist()
@@ -112,8 +115,9 @@ class RAGPipeline:
 
         retrieved = []
         for i in range(len(results["documents"][0])):
-            # Convert distance to similarity score
-            score = 1 - results["distances"][0][i]
+            # ChromaDB returns L2 distances, convert properly
+            distance = results["distances"][0][i]
+            score = 1 / (1 + distance)  # converts distance to 0-1 similarity
 
             if score >= min_score:
                 retrieved.append({
