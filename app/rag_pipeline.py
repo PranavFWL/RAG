@@ -3,6 +3,7 @@ import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain_ollama import ChatOllama
+from pathlib import Path
 from langchain_community.document_loaders import PyMuPDFLoader, DirectoryLoader, TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
@@ -32,9 +33,10 @@ class RAGPipeline:
         print("🚀 Starting RAG Pipeline...")
 
         # Step 1 - LLM (local Ollama)
+        ollama_host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
         self.llm = ChatOllama(
             model="phi3",
-            base_url="http://localhost:11434"
+            base_url=ollama_host
         )
         print("✅ Ollama phi3 connected")
 
@@ -47,22 +49,43 @@ class RAGPipeline:
         self.collection = self.chroma.get_or_create_collection("rag_docs")
         print("✅ ChromaDB connected")
 
-        # Step 4 - Load and index documents
+        # Step 4 - Load documents and build indexes
         self._load_documents()
-        print("✅ RAG Pipeline ready!\n")
-
-        self._load_documents()
-        self._build_bm25()  # ← add this line
+        self._build_bm25()
         print("✅ RAG Pipeline ready!\n")
 
     # ── Document Loading ───────────────────────────────────
     def _load_documents(self):
         """Load PDFs and text files, chunk them, store in ChromaDB"""
 
-        # Skip if already indexed
-        if self.collection.count() > 0:
-            print(f"📚 Found {self.collection.count()} chunks already indexed, skipping reload")
+        # Check if all source files are indexed
+        existing = self.collection.get(include=['metadatas'])
+        indexed_sources = set([
+            Path(m.get('source', '')).name 
+            for m in existing['metadatas']
+        ])
+        available_sources = set([
+            f.name for f in PDF_DIR.iterdir() 
+            if f.suffix == '.pdf'
+        ] + [
+            f.name for f in TXT_DIR.iterdir() 
+            if f.suffix == '.txt'
+        ] if TXT_DIR.exists() else [
+            f.name for f in PDF_DIR.iterdir() 
+            if f.suffix == '.pdf'
+        ])
+
+        print(f"📚 Indexed: {indexed_sources}")
+        print(f"📂 Available: {available_sources}")
+
+        if indexed_sources >= available_sources and self.collection.count() > 0:
+            print(f"📚 All files already indexed ({self.collection.count()} chunks), skipping reload")
             return
+        else:
+            missing = available_sources - indexed_sources
+            print(f"🔄 Missing files detected: {missing}, reindexing...")
+            self.chroma.delete_collection("rag_docs")
+            self.collection = self.chroma.get_or_create_collection("rag_docs")
 
         docs = []
 
@@ -99,12 +122,23 @@ class RAGPipeline:
         texts = [c.page_content for c in chunks]
         embeddings = self.embedder.encode(texts).tolist()
 
+        # Fix metadata - ensure source is always set
+        metadatas = []
+        for c in chunks:
+            meta = dict(c.metadata)
+            if 'source' not in meta or not meta['source']:
+                meta['source'] = 'unknown'
+            # Convert all values to strings (ChromaDB requirement)
+            meta = {k: str(v) for k, v in meta.items()}
+            metadatas.append(meta)
+
         self.collection.add(
             documents=texts,
             embeddings=embeddings,
-            metadatas=[c.metadata for c in chunks],
+            metadatas=metadatas,
             ids=[f"chunk_{i}" for i in range(len(chunks))]
         )
+
         print(f"💾 Stored {len(chunks)} chunks in ChromaDB")
 
     def _build_bm25(self):

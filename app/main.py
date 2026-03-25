@@ -159,13 +159,25 @@ async def get_chat_history(session_id: str):
 @app.post("/ingest")
 async def ingest():
     try:
+        print("Starting ingest...")
+        print(f"Before delete: {pipeline.collection.count()} chunks")
+        
         pipeline.chroma.delete_collection("rag_docs")
+        print("Collection deleted!")
+        
         pipeline.collection = pipeline.chroma.get_or_create_collection("rag_docs")
+        print(f"New collection count: {pipeline.collection.count()}")
+        
         pipeline._load_documents()
+        print(f"After load: {pipeline.collection.count()}")
+        
+        pipeline._build_bm25()
+
         return {
             "status":  "success",
             "message": "Documents reingested",
             "count":   pipeline.collection.count()
         }
     except Exception as e:
+        print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
